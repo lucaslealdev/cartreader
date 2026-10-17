@@ -1377,6 +1377,79 @@ byte readByte_Flash(unsigned long myAddress) {
   return tempByte;
 }
 
+/******************************************
+   Fast low level functions for SNES LoRom/HiRom repros
+   Same pinout as writeByte_Flash/readByte_Flash for mapping 1 and 2,
+   but without the slow 32bit shifts and with shorter delays
+ *****************************************/
+boolean fastBus_Flash() {
+  return ((mapping == 1) || (mapping == 2)) && !byteCtrl;
+}
+
+// Calculate PORTF, PORTK and PORTL values for an address
+void addressPorts_Flash(unsigned long myAddress, byte& portF, byte& portK, byte& portL) {
+  byte a8 = (myAddress >> 8) & 0xFF;
+  byte a16 = (myAddress >> 16) & 0xFF;
+
+  // A0-A7
+  portF = myAddress & 0xFF;
+  // SNES LoRom
+  if (mapping == 1) {
+    // A8-A14, set SNES A15(PK7) HIGH to disable SRAM
+    portK = a8 | 0x80;
+    // A15-A22
+    portL = (a16 << 1) | (a8 >> 7);
+  }
+  // SNES HiRom
+  else {
+    // A8-A15
+    portK = a8;
+    // A16-A23, set PL7 to value of PL6 and switch SNES BA6(PL6) to HIGH to disable SRAM
+    portL = (a16 & 0x7F) | ((a16 & 0x40) << 1) | 0x40;
+  }
+}
+
+// Always inlined, a function call takes longer than the write itself
+inline __attribute__((always_inline)) void writePorts_Flash(byte portF, byte portK, byte portL, byte myData) {
+  PORTF = portF;
+  PORTK = portK;
+  PORTL = portL;
+  PORTC = myData;
+
+  // Wait till output is stable
+  NOP;
+
+  // Switch WE(PH4) WE_SNS(PH5) to LOW
+  PORTH &= ~((1 << 4) | (1 << 5));
+
+  // Leave WE low for at least 60ns
+  NOP;
+  NOP;
+
+  // Switch WE(PH4) WE_SNS(PH5) to HIGH
+  PORTH |= (1 << 4) | (1 << 5);
+}
+
+// Read data bus at the address that is already set
+inline __attribute__((always_inline)) byte readData_Flash() {
+  // Setting OE(PH1) OE_SNS(PH3) LOW
+  PORTH &= ~((1 << 1) | (1 << 3));
+
+  // Wait at least 90ns for the flashrom output
+  NOP;
+  NOP;
+  NOP;
+  NOP;
+
+  // Read
+  byte tempByte = PINC;
+
+  // Setting OE(PH1) OE_SNS(PH3) HIGH
+  PORTH |= (1 << 1) | (1 << 3);
+
+  return tempByte;
+}
+
 void writeWord_Flash(unsigned long myAddress, word myData) {
   PORTF = myAddress & 0xFF;
   PORTK = (myAddress >> 8) & 0xFF;
@@ -2258,6 +2331,7 @@ void verifyFlash() {
 void verifyFlash(byte currChip, byte totalChips, boolean reversed) {
   if (openVerifyFlashFile()) {
     blank = 0;
+    boolean fastBus = fastBus_Flash();
 
     // Adjust filesize to fit flashchip
     adjustFileSizeOffset(currChip, totalChips, reversed);
@@ -2279,9 +2353,25 @@ void verifyFlash(byte currChip, byte totalChips, boolean reversed) {
 
       //fill sdBuffer
       myFile.read(sdBuffer, 512);
-      for (int c = 0; c < 512; c++) {
-        if (readByte_Flash(currByte + c) != sdBuffer[c]) {
-          blank++;
+      if (fastBus) {
+        byte portF, portK, portL;
+        for (int c = 0; c < 512; c++) {
+          // A8-A23 only change every 256 bytes
+          if ((c & 0xFF) == 0) {
+            addressPorts_Flash(currByte + c, portF, portK, portL);
+            PORTK = portK;
+            PORTL = portL;
+          }
+          PORTF = c & 0xFF;
+          if (readData_Flash() != sdBuffer[c]) {
+            blank++;
+          }
+        }
+      } else {
+        for (int c = 0; c < 512; c++) {
+          if (readByte_Flash(currByte + c) != sdBuffer[c]) {
+            blank++;
+          }
         }
       }
       // Update progress bar
@@ -2955,19 +3045,20 @@ void sendCFICommand_Flash(byte cmd) {
   writeByteCompensated_Flash(0xAAA, cmd);
 }
 
-byte readByteCompensated_Flash(int address) {
-  byte data = readByte_Flash(address >> (flashX16Mode ? 1 : 0));
+// Swap D0 and D1 if needed, works in both directions
+byte compensateByte_Flash(byte data) {
   if (flashSwitchLastBits) {
     return (data & 0b11111100) | ((data << 1) & 0b10) | ((data >> 1) & 0b01);
   }
   return data;
 }
 
+byte readByteCompensated_Flash(int address) {
+  return compensateByte_Flash(readByte_Flash(address >> (flashX16Mode ? 1 : 0)));
+}
+
 void writeByteCompensated_Flash(int address, byte data) {
-  if (flashSwitchLastBits) {
-    data = (data & 0b11111100) | ((data << 1) & 0b10) | ((data >> 1) & 0b01);
-  }
-  writeByte_Flash(address >> (flashX16Mode ? 1 : 0), data);
+  writeByte_Flash(address >> (flashX16Mode ? 1 : 0), compensateByte_Flash(data));
 }
 
 void startCFIMode_Flash(boolean x16Mode) {
@@ -3227,6 +3318,15 @@ void writeCFI_Flash(byte currChip, byte totalChips, boolean reversed) {
       println_Msg(F("..."));
     display_Update();
 
+    // Precalculate the command sequence for the fast LoRom/HiRom write
+    boolean fastBus = fastBus_Flash();
+    byte cmd1F, cmd1K, cmd1L, cmd2F, cmd2K, cmd2L;
+    addressPorts_Flash(0xAAA >> (flashX16Mode ? 1 : 0), cmd1F, cmd1K, cmd1L);
+    addressPorts_Flash(0x555 >> (flashX16Mode ? 1 : 0), cmd2F, cmd2K, cmd2L);
+    byte cmdUnlock1 = compensateByte_Flash(0xaa);
+    byte cmdUnlock2 = compensateByte_Flash(0x55);
+    byte cmdProgram = compensateByte_Flash(0xa0);
+
     //Initialize progress bar
     uint32_t processedProgressBar = 0;
     uint32_t totalProgressBar = (uint32_t)fileSize;
@@ -3248,20 +3348,49 @@ void writeCFI_Flash(byte currChip, byte totalChips, boolean reversed) {
       if (currAddr % 4096 == 0)
         blinkLED();
 
+      // A8-A23 port values for both 256 byte halves of the buffer
+      byte dataF, dataK[2], dataL[2];
+      if (fastBus) {
+        addressPorts_Flash(currAddr, dataF, dataK[0], dataL[0]);
+        addressPorts_Flash(currAddr + 256, dataF, dataK[1], dataL[1]);
+      }
+
       for (int currByte = 0; currByte < 512; currByte++) {
-        // Write command sequence
-        dataOut();
-        sendCFICommand_Flash(0xa0);
+        // Flash was just erased, 0xFF bytes don't need to be programmed
+        if (sdBuffer[currByte] == 0xFF)
+          continue;
 
-        // Write current byte
-        writeByte_Flash(currAddr + currByte, sdBuffer[currByte]);
+        if (fastBus) {
+          // Write command sequence
+          dataOut();
+          writePorts_Flash(cmd1F, cmd1K, cmd1L, cmdUnlock1);
+          writePorts_Flash(cmd2F, cmd2K, cmd2L, cmdUnlock2);
+          writePorts_Flash(cmd1F, cmd1K, cmd1L, cmdProgram);
 
-        dataIn8();
+          // Write current byte
+          byte half = currByte >> 8;
+          writePorts_Flash(currByte & 0xFF, dataK[half], dataL[half], sdBuffer[currByte]);
 
-        // Read the status register
-        byte statusReg = readByte_Flash(currAddr + currByte);
-        while ((statusReg & 0x80) != (sdBuffer[currByte] & 0x80)) {
-          statusReg = readByte_Flash(currAddr + currByte);
+          dataIn8();
+
+          // Read the status register, address is still set from the write
+          while ((readData_Flash() & 0x80) != (sdBuffer[currByte] & 0x80)) {
+          }
+        } else {
+          // Write command sequence
+          dataOut();
+          sendCFICommand_Flash(0xa0);
+
+          // Write current byte
+          writeByte_Flash(currAddr + currByte, sdBuffer[currByte]);
+
+          dataIn8();
+
+          // Read the status register
+          byte statusReg = readByte_Flash(currAddr + currByte);
+          while ((statusReg & 0x80) != (sdBuffer[currByte] & 0x80)) {
+            statusReg = readByte_Flash(currAddr + currByte);
+          }
         }
       }
       // update progress bar
